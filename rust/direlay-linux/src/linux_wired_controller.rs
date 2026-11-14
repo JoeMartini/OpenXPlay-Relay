@@ -180,6 +180,17 @@ pub struct LinuxWiredController {
     timing: WiredTiming,
     head_unit_manager: Mutex<Option<Arc<dyn WirelessHotspotManager>>>,
 }
+
+/// Local PoC helper: does this host expose any 802.11 radio at all?
+fn host_has_wifi_radio() -> bool {
+    std::fs::read_dir("/sys/class/net")
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().join("phy80211").exists())
+        })
+        .unwrap_or(false)
+}
 impl LinuxWiredController {
     pub fn new(
         platform: Arc<dyn WiredPlatform>,
@@ -733,10 +744,20 @@ impl LinuxWiredController {
         let stream = match mux.open_carkit(&record) {
             Ok(stream) => stream,
             Err(e) if e.invalidates_record() => {
-                remove_pair_record(&path)?;
-                record = self.pair(generation, mux.as_ref(), &path)?;
-                self.stage_event(generation, CONNECTING_CONTROL, serde_json::json!({}))?;
-                mux.open_carkit(&record).map_err(pairing_error)?
+                // [local PoC patch — not upstream] 一次瞬时失败不该吃掉唯一能用的配对记录：
+                // 记录一旦被删，iPhone 就会要求人手重新点「信任」，而中继是无人头设备。
+                // 所以先用原记录重试一次，只有连续两次都判定失效才真删（删前留 .bak 以便人工恢复）。
+                match mux.open_carkit(&record) {
+                    Ok(stream) => stream,
+                    Err(e2) if e2.invalidates_record() => {
+                        backup_pair_record(&path)?;
+                        remove_pair_record(&path)?;
+                        record = self.pair(generation, mux.as_ref(), &path)?;
+                        self.stage_event(generation, CONNECTING_CONTROL, serde_json::json!({}))?;
+                        mux.open_carkit(&record).map_err(pairing_error)?
+                    }
+                    Err(e2) => return Err(pairing_error(e2)),
+                }
             }
             Err(e) => return Err(pairing_error(e)),
         };
@@ -816,6 +837,16 @@ impl LinuxWiredController {
     fn head_unit_network(&self, generation: u64) -> Result<()> {
         if self.state.0.lock().unwrap().hotspot.is_some() {
             self.validate_head_unit()?;
+            while !self.platform.car_ready()? {
+                self.wait(generation, self.timing.tick)?;
+            }
+            return Ok(());
+        }
+        // Local PoC (NOT upstream): on a host with no Wi-Fi radio no access point can be created,
+        // and a wired USB CarPlay session does not need one — the iPhone link is the USB TAP and
+        // the head-unit browser reaches the relay over Ethernet. Wait for the head unit directly
+        // instead of failing the whole start with a hotspot error.
+        if !host_has_wifi_radio() {
             while !self.platform.car_ready()? {
                 self.wait(generation, self.timing.tick)?;
             }
@@ -1000,6 +1031,16 @@ fn load_pair_record(path: &Path) -> Result<Option<LockdownPairRecord>> {
         },
         None => Ok(None),
     }
+}
+/// [local PoC patch — not upstream] 删配对记录前先留一份 `.bak`。
+/// 记录被误删的代价是必须有人亲手在 iPhone 上点一次「信任」，中继自身无法恢复。
+fn backup_pair_record(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let backup = path.with_extension("plist.bak");
+    std::fs::copy(path, &backup)?;
+    Ok(())
 }
 fn remove_pair_record(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {

@@ -6,6 +6,7 @@
 /// Fallible protocol/platform operation; malformed data and I/O errors propagate.
 pub type Result<T> = std::io::Result<T>;
 mod carlink_resize;
+pub mod audio_transcode;   // [local PoC patch — not upstream] LPCM → Opus 转码
 pub mod carplay_controller;
 /// cli protocol module.
 #[path = "main.rs"]

@@ -30,6 +30,8 @@ pub mod air_play_tcp_accepted;
 pub mod audio_stream;
 /// bplist codec protocol module.
 pub mod bplist_codec;
+// [local PoC patch — not upstream] 面板 EDID 生成
+pub mod edid;
 /// buffered audio stream protocol module.
 pub mod buffered_audio_stream;
 /// bytes protocol module.

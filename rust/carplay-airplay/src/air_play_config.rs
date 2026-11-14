@@ -55,6 +55,9 @@ pub struct AirPlayDisplayConfig {
 
     pub safe_area: Option<AirPlayInsets>,
 
+    /// [local PoC patch — not upstream] 面板 EDID（真车机带，iPhone 用它认识面板能力）。
+    pub edid: Option<Vec<u8>>,
+
     pub view_area: Option<AirPlayInsets>,
 }
 /// `AirPlayConfig` protocol data.
@@ -171,6 +174,7 @@ impl AirPlayDisplayConfig {
             height_physical_mm: None,
             safe_area: None,
             view_area: None,
+            edid: None,
         }
     }
 }

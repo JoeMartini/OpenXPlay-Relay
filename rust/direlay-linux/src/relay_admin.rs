@@ -513,6 +513,15 @@ impl LinuxRelayAdmin {
     fn wifi_present(&self, interface: &str) -> bool {
         self.net_root.join(interface).join("address").exists()
     }
+    /// Local PoC waiver (NOT upstream): wired CarPlay over USB needs no Wi-Fi radio — the
+    /// iPhone link is the USB TAP (`oxpusb0`) and the head-unit browser reaches the relay over
+    /// Ethernet. Upstream holds the start with `radio_unavailable` when no Wi-Fi interface
+    /// exists, which blocks a wired-only host like this one.
+    fn wired_without_radio(&self) -> bool {
+        self.effective_options()
+            .map(|options| options.transport == "usb")
+            .unwrap_or(false)
+    }
     fn prepare_wifi(&self) -> Result<bool> {
         let options = self.effective_options()?;
         let mut provision = self.provision.lock().unwrap();
@@ -2189,7 +2198,7 @@ impl LinuxRelayAdmin {
         {
             return Ok(());
         }
-        if !self.wifi_present(&self.effective_options()?.wifi_interface) {
+        if !self.wifi_present(&self.effective_options()?.wifi_interface) && !self.wired_without_radio() {
             self.stop_controller();
             self.hold_start("radio_unavailable", serde_json::json!({"wifi":"absent"}));
             return Ok(());
@@ -2202,7 +2211,7 @@ impl LinuxRelayAdmin {
             }
         }
         if self.provision.lock().unwrap().is_none() {
-            if !self.wifi_present(&self.effective_options()?.wifi_interface) {
+            if !self.wifi_present(&self.effective_options()?.wifi_interface) && !self.wired_without_radio() {
                 return Ok(());
             }
             self.operation(Operation::Startup)?;
@@ -2304,10 +2313,14 @@ impl LinuxRelayAdmin {
                 &options.state_dir,
                 &options.identity_dir,
             ) == "ready";
-        let network_ready = self.wifi_present(&options.wifi_interface)
+        let network_ready = (self.wifi_present(&options.wifi_interface)
             && wifi != Some(false)
             && (options.settings.network_mode != "shared-wifi"
-                || self.wifi_status().ssid.is_some());
+                || self.wifi_status().ssid.is_some()))
+            // Local PoC waiver (NOT upstream): with wired USB CarPlay the iPhone link is the USB
+            // TAP and the head-unit browser can arrive over Ethernet, so a missing Wi-Fi radio
+            // must not hold the start.
+            || (usb && self.wired_without_radio());
         let selected = matches!(
             selection.reason(),
             "Selected" | "Connected" | "OnlyCandidate"
@@ -2374,11 +2387,11 @@ impl LinuxRelayAdmin {
         {
             return Ok(());
         }
-        if self.provision.lock().unwrap().is_none() {
+        if self.provision.lock().unwrap().is_none() && !self.wired_without_radio() {
             self.hold_start("provisioning", serde_json::json!({}));
             return Ok(());
         }
-        if !self.wifi_present(&self.effective_options()?.wifi_interface) {
+        if !self.wifi_present(&self.effective_options()?.wifi_interface) && !self.wired_without_radio() {
             self.hold_start("radio_unavailable", serde_json::json!({"wifi":"absent"}));
             return Ok(());
         }
@@ -2437,7 +2450,7 @@ impl LinuxRelayAdmin {
                     .join(&options.wifi_interface)
                     .join("address")
                     .exists();
-        if bluetooth_problem || wifi_off {
+        if bluetooth_problem || (wifi_off && !self.wired_without_radio()) {
             let state = |off: bool| if off { "off" } else { "on" };
             self.hold_start(
                 "radio_unavailable",

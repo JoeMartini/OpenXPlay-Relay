@@ -39,12 +39,16 @@ impl AudioPolicy {
                 ))
             }
         };
+        // [local PoC patch — not upstream] Media audio from a wired iPhone arrives as **LPCM 48 kHz
+        // stereo**, and the web receiver already decodes PCM_S16LE (`receiver/worker.ts` maps it to
+        // Float32 planes), yet upstream accepted only AAC-LC for the media role and dropped LPCM with
+        // "no AAC transcoder". Dropping it also made iOS keep the podcast on the **phone speaker**
+        // instead of routing it to this head unit. Accept LPCM passthrough alongside AAC-LC.
+        let media_codec_ok = matches!(codec, AudioCodec::AacLc | AudioCodec::PcmS16le);
         if !(1..=2).contains(&source.channels)
             || !(8000..=48000).contains(&source.sample_rate)
             || (role == AudioRole::Media
-                && (codec != AudioCodec::AacLc
-                    || source.sample_rate != 48000
-                    || source.channels != 2))
+                && (!media_codec_ok || source.sample_rate != 48000 || source.channels != 2))
             || (role != AudioRole::Media && codec == AudioCodec::AacLc)
         {
             return Err(std::io::Error::other(format!(

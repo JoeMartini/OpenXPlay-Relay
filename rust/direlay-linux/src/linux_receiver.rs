@@ -57,6 +57,7 @@ pub(crate) fn build_receiver(setup: ReceiverSetup) -> Result<Arc<LinuxAirPlaySer
         active: Mutex::new(Vec::new()),
         current: setup.current,
         watchdog: setup.watchdog.clone(),
+        first_frame_reported: Arc::new(AtomicBool::new(false)),
     });
     let mut server = LinuxAirPlayServer::new(
         setup.address,
@@ -100,6 +101,10 @@ pub(crate) struct SessionListener {
     pub(crate) events: Arc<JsonEvents>,
     pub(crate) active: Mutex<Vec<Weak<AirPlaySession>>>,
     pub(crate) watchdog: Arc<Mutex<Option<carplay_airplay::first_tcp_watchdog::FirstTcpWatchdog>>>,
+    /// [local PoC patch — not upstream] 每会话只报一次 `first_video_rendered`：
+    /// 上游在每个渲染帧的路径上都会 emit 一条 `airplay-milestone`（实测 8.4 行/秒），
+    /// 而这条路径是帧转发的热路径，同步写日志会给帧交付引入不必要的抖动。
+    pub(crate) first_frame_reported: Arc<AtomicBool>,
 }
 impl SessionListener {
     fn current(&self) -> bool {
@@ -151,7 +156,10 @@ impl AirPlaySessionListener for SessionListener {
     fn on_video_frame_rendered(&self, session: &AirPlaySession) {
         if self.current() {
             self.report(WirelessSessionEvent::Rendered(session.id()));
-            self.events.startup_milestone("first_video_rendered");
+            // [local PoC patch — not upstream] 上游这里每帧都发一次 milestone（日志 8 行/秒、且在热路径上）。
+            if !self.first_frame_reported.swap(true, Ordering::AcqRel) {
+                self.events.startup_milestone("first_video_rendered");
+            }
         }
     }
     fn on_session_active(&self, s: Arc<AirPlaySession>) {

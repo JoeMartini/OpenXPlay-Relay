@@ -879,6 +879,15 @@ impl DisplayRuntime {
                 .collect()
         });
         config.initial_view_area = 0;
+        // [local PoC patch — not upstream] 补面板 EDID：真车机在 /info 的 display 里都带。
+        // 实测收益为零（动画帧率 11→13 fps，噪声级），所以**默认不带**，要试才设 OXP_EDID=1。
+        if std::env::var("OXP_EDID").ok().as_deref() == Some("1") {
+            config.edid = Some(carplay_airplay::edid::panel_edid(
+                t.canvas.width,
+                t.canvas.height,
+                config.fps.max(30),
+            ));
+        }
     }
     pub fn area_message(&self) -> oxp_wire::Message {
         let area = if self.active == 0 {

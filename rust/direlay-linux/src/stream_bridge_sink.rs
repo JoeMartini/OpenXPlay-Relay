@@ -297,6 +297,37 @@ impl MediaSink for StreamBridgeSink {
                         channels: f.channels,
                         config: f.config.map(|c| c.to_vec()),
                     };
+                    // [local PoC patch — not upstream] 媒体 LPCM 转 Opus：
+                    // 只在部署开关打开、目标客户端声明支持 OPUS、且确实是 Media 角色的未压缩 PCM 时启用。
+                    // 未启用 = 原样直通（上游行为）。
+                    let transcode = if crate::audio_transcode::opus_enabled()
+                        && matches!(f.role, oxp_core::model::AudioRole::Media)
+                        && matches!(f.codec, oxp_core::model::AudioCodec::PcmS16le)
+                        && (1..=2).contains(&f.channels)
+                    {
+                        match crate::audio_transcode::OpusTranscoder::new(
+                            f.sample_rate,
+                            f.channels as usize,
+                            crate::audio_transcode::OPUS_BITRATE,
+                        ) {
+                            Ok(t) => Some(Arc::new(Mutex::new(t))),
+                            Err(e) => {
+                                self.dropped("audio-transcode-unavailable", e);
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let target = if transcode.is_some() {
+                        // 向客户端声明的是 Opus 而不是 LPCM；码率降 ~17 倍。
+                        oxp_wire::AudioFormat {
+                            codec: oxp_wire::AudioCodec::Opus,
+                            ..target
+                        }
+                    } else {
+                        target
+                    };
                     let input = self.input.clone();
                     let end_input = input.clone();
                     let session = s.session;
@@ -320,6 +351,7 @@ impl MediaSink for StreamBridgeSink {
                         format.clone(),
                         predecessor,
                         Arc::new(move |payload, pts| {
+                            // 本机 ALSA 出声那条路仍吃原始 PCM（不转码）。
                             if let Some(playback) = &*playback.lock().unwrap() {
                                 playback.offer(&payload);
                             }
@@ -328,21 +360,30 @@ impl MediaSink for StreamBridgeSink {
                                     input.publish(session, &format!("2-audio-{stream}"), m);
                                 }
                             }
-                            input.publish(
-                                session,
-                                "",
-                                Message::Binary {
-                                    header: Header {
-                                        kind: Kind::Audio,
-                                        stream: stream as u8,
-                                        flags: 0,
-                                        sequence: 0,
-                                        pts_us: pts,
-                                        sender_clock_us: pts,
-                                    },
-                                    payload,
+                            let frames = match &transcode {
+                                None => vec![(payload, pts)],
+                                Some(t) => match t.lock() {
+                                    Ok(mut t) => t.push(&payload, pts),
+                                    Err(_) => vec![(payload, pts)],
                                 },
-                            );
+                            };
+                            for (data, frame_pts) in frames {
+                                input.publish(
+                                    session,
+                                    "",
+                                    Message::Binary {
+                                        header: Header {
+                                            kind: Kind::Audio,
+                                            stream: stream as u8,
+                                            flags: 0,
+                                            sequence: 0,
+                                            pts_us: frame_pts,
+                                            sender_clock_us: frame_pts,
+                                        },
+                                        payload: data,
+                                    },
+                                );
+                            }
                         }),
                         Arc::new(move || {
                             playback_end.lock().unwrap().take();

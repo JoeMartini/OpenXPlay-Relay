@@ -183,6 +183,9 @@ impl WiredPlatform for LinuxWiredPlatform {
             self.options.settings.car_bluetooth_audio,
             crate::carplay_policy::iap_channel_only_when_offered(&self.input.connection_settings()),
         );
+        // [local PoC patch — not upstream] 把 CarPlay 的 dock 放到右侧：rightHandDrive=true 会让
+        // iPhone 按右舵布局排布（dock 在右），从而避开车机浏览器自己的"退出全屏"按钮。
+        config.right_hand_drive = true;
         self.input.configure_display(&mut config.main);
         config.port = 7000;
         let closed = Arc::new(AtomicBool::new(false));

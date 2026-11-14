@@ -188,6 +188,14 @@ fn audio_formats(c: &AirPlayConfig) -> V {
         (101, "compatibility", pcm, None),
         (100, "default", speech | output_opus, wireless),
         (100, "alert", speech | output_opus, None),
+        // [local PoC patch — not upstream] 媒体优先 AAC 而不是 LPCM。
+        // 实测 LPCM 是 48k/2ch 未压缩 = **1657 kbps**，且手机→中继侧持续出现 seqForwardGaps
+        // （一分钟 400+ 个缺包，听感是卡顿 + 爆破音），未压缩音频把接收侧的窗口压得太紧。
+        // 改广告 AAC-LC（type-102 那条本来就有），预期降到 ~200 kbps。客户端 worker 已支持 mp4a.40.2。
+        // 验收：若 `Receive: audio` 彻底消失（手机自己外放）→ 立刻回退成 `pcm`。
+        // [local PoC patch — not upstream] 媒体必须广告 LPCM。
+        // 实测反证：把这里换成 `aac` 后 iPhone **完全不再发媒体音频**（日志 `Receive: audio` 归零、
+        // `audio-dropped` 也为 0，即手机自己外放），与上游经验一致。想看 AAC 只能靠中继转码，不能靠改广告。
         (100, "media", pcm, None),
         (100, "telephony", mono | output_opus, wireless),
         (100, "speechRecognition", mono | output_opus, wireless),
@@ -235,6 +243,10 @@ fn display_entry(c: &AirPlayDisplayConfig) -> V {
         ("mapAppearanceMode", 0u64.into()),
         ("mapAppearanceSetting", 0u64.into()),
     ]);
+    // [local PoC patch — not upstream] 真车机都带面板 EDID
+    if let Some(edid) = &c.edid {
+        push(&mut entry, "edid", V::Data(edid.clone()));
+    }
     let areas = c.view_areas.as_ref().filter(|a| !a.is_empty());
     let views = match areas {
         Some(a) => a.iter().map(|a| area_dict(c, Some(a))).collect(),
