@@ -17,6 +17,12 @@ use std::{
 };
 
 pub type FailureCallback = Arc<dyn Fn(io::Error) + Send + Sync>;
+
+/// [local PoC patch — not upstream] 会话开始前给接收端重连留的宽限，见 callbacks() 的说明。
+fn session_start_grace() -> Option<Duration> {
+    let ms = std::env::var("OXP_SESSION_START_GRACE_MS").ok()?.parse::<u64>().ok()?;
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
 /// Implementations must honor deadlines and wake pending operations when closed.
 pub trait WiredDevice: CloseResource {
     fn discover(&self) -> Result<UsbDescriptors>;
@@ -900,6 +906,19 @@ impl LinuxWiredController {
         let (state, events, memory) =
             (self.state.clone(), self.events.clone(), self.memory.clone());
         let start = Arc::new(move || {
+            // [local PoC patch — not upstream] StartSession 在 boot 后约 2 秒就发出，而中继重启时
+            // 车机浏览器要 ~10 秒才重连；能力快照里因此没有媒体音频 ⇒ 整场会话没有声音，
+            // 只有物理拔插 USB 才能恢复。这里在发 StartSession 之前给接收端一个可配宽限
+            // （OXP_SESSION_START_GRACE_MS，默认 0 即上游行为）。
+            if let Some(grace) = session_start_grace() {
+                let deadline = Instant::now() + grace;
+                while Instant::now() < deadline {
+                    if check_state(&state.0.lock().unwrap(), generation).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
             let receiver = {
                 let mut s = state.0.lock().unwrap();
                 if check_state(&s, generation).is_err() || s.start_sent {
