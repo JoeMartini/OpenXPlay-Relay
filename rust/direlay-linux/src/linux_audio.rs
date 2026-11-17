@@ -145,28 +145,6 @@ struct RunState {
     bytes: usize,
     accepting: bool,
     done: bool,
-    /// [local PoC patch — not upstream] 上一包的 (RTP 时间戳, 采样数)，用来发现缺口。
-    rtp_last: Option<(u32, u32)>,
-    /// [local PoC patch] 已补的静音采样总数（诊断用）。
-    gap_filled_samples: u64,
-}
-
-/// [local PoC patch — not upstream] 手机→中继稳定缺 ~3% 音频包（`oxpusb0` 线级取证：
-/// 序号集合真缺失、零乱序零重复）。而 `oxp_core::AudioClock` 只按**收到的**样本数推进时间戳，
-/// 缺口在下游完全不可见 ⇒ 听感就是“内容被跳过 / 一小段快进”，客户端也无从补。
-/// 这里用 RTP 时间戳算出缺了多少采样，入队等长静音，让时间线连续。
-/// 边界：回绕（wrapping_sub 后为超大值）、< 5 ms 的抖动、> 2 s 的暂停都不补。
-pub fn gap_samples(ts: u32, last_ts: u32, last_samples: u32, rate: u32) -> u64 {
-    let advance = u64::from(ts.wrapping_sub(last_ts));
-    let expected = u64::from(last_samples);
-    if rate == 0 || advance <= expected {
-        return 0;
-    }
-    let missing = advance - expected;
-    if missing < u64::from(rate) / 200 || missing > u64::from(rate) * 2 {
-        return 0;
-    }
-    missing
 }
 pub struct AudioPolicyRun {
     source: AudioFormat,
@@ -193,8 +171,6 @@ impl AudioPolicyRun {
                     bytes: 0,
                     accepting: true,
                     done: false,
-                    rtp_last: None,
-                    gap_filled_samples: 0,
                 }),
                 std::sync::Condvar::new(),
             )),
@@ -302,29 +278,6 @@ impl AudioPolicyRun {
                 break;
             }
         }
-        // [local PoC patch — not upstream] 缺口补静音：RTP 时间戳跳了就先把缺的采样补成静音入队。
-        // 只对未压缩 LPCM 做（AAC/Opus 的静音得重新编码，不属于这一层）。
-        if self.source.codec == AudioCodecKind::Lpcm && (1..=2).contains(&self.source.channels) {
-            let rate = self.source.sample_rate;
-            if let Some(ts) = rtp
-                .get(4..8)
-                .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
-            {
-                if let Some((last_ts, last_samples)) = s.rtp_last {
-                    let missing = gap_samples(ts, last_ts, last_samples, rate);
-                    if missing > 0 {
-                        let fill_bytes = missing as usize * self.source.channels as usize * 2;
-                        let fill_us = missing * 1_000_000 / u64::from(rate);
-                        s.gap_filled_samples += missing;
-                        s.queued_us += fill_us;
-                        s.bytes += fill_bytes;
-                        s.queue
-                            .push_back((vec![0u8; fill_bytes], arrival_us, fill_us));
-                    }
-                }
-                s.rtp_last = Some((ts, n));
-            }
-        }
         s.bytes += payload.len();
         s.queued_us += duration;
         s.queue.push_back((payload.to_vec(), arrival_us, duration));
@@ -344,4 +297,3 @@ impl AudioPolicyRun {
         Ok(())
     }
 }
-
