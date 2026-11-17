@@ -36,6 +36,35 @@ struct DiagnosticsState {
 #[derive(Default)]
 pub struct ReceiverDiagnostics {
     state: Mutex<DiagnosticsState>,
+    /// [local PoC patch — not upstream] 上次把客户端 stats 打到日志的时间，用于节流。
+    stats_logged: Mutex<Option<Instant>>,
+}
+
+/// [local PoC patch — not upstream] 把浏览器每秒上报的 stats 里真正能定性的几项打到日志，
+/// 这样"界面落后几秒"这类问题可以在服务端直接量出来，而不用猜。
+/// 只在 OXP_LOG_RECEIVER_STATS=1 时生效，默认不打扰上游行为。
+fn log_receiver_stats(sample: &Value, throttled: &mut Option<Instant>, now: Instant) {
+    if std::env::var("OXP_LOG_RECEIVER_STATS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let window = Duration::from_secs(5);
+    if throttled.is_some_and(|at| now.saturating_duration_since(at) < window) {
+        return;
+    }
+    *throttled = Some(now);
+    let f = |key: &str| sample.get(key).cloned().unwrap_or(Value::Null);
+    let line = json!({
+        "event": "diagnostic",
+        "message": format!(
+            "receiver stats decodedLatency={}ms renderLatency={}ms p95={}ms decodeQueue={} renderedFps={} dropped={} late={} superseded={} resets={} decodeMs={}",
+            f("decodedLatencyMs"), f("renderedLatencyMs"), f("decodedLatencyP95Ms").as_f64().unwrap_or(-1.0),
+            f("decodeQueue"), f("renderedFps"), f("dropped"), f("renderLateFrames"),
+            f("renderSupersededFrames"), f("decoderResets"), f("decodeMs"),
+        ),
+        "time": crate::platform::wall_clock().as_millis() as u64,
+        "type": "diagnostic",
+    });
+    eprintln!("{line}");
 }
 impl ReceiverDiagnostics {
     /// Takes oxp-relay's `receiver-info` and `stats` events and returns whether the event was
@@ -92,6 +121,10 @@ impl ReceiverDiagnostics {
         };
         if !entry.is_object() || serde_json::to_vec(&entry).map_or(true, |b| b.len() > limit) {
             return true;
+        }
+        if kind == "stats" {
+            let mut at = self.stats_logged.lock().unwrap();
+            log_receiver_stats(&entry, &mut at, now);
         }
         let mut state = self.state.lock().unwrap();
         if kind == "fullscreen-exit" {

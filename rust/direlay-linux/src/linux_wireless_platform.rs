@@ -964,6 +964,7 @@ mod network_tests {
             carplay_airplay::first_tcp_watchdog::FirstTcpWatchdog::new(identity.clone());
         watch.start_session_sent(now);
         let listener = SessionListener {
+            first_frame_reported: Arc::new(AtomicBool::new(false)),
             current: None,
             input: None,
             callbacks: NetworkCallbacks {

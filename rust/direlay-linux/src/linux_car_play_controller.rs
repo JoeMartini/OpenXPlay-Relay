@@ -1763,6 +1763,7 @@ mod handoff_tests {
                 Arc::new(move |e: std::io::Error| abort(&st, GENERATION, e.to_string()));
             let st = state.clone();
             let listener = Arc::new(SessionListener {
+                first_frame_reported: Arc::new(AtomicBool::new(false)),
                 current: Some(Arc::new(move || {
                     attempt_check(&st.0.lock().unwrap(), GENERATION).is_ok()
                 })),
