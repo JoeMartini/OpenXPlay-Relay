@@ -300,12 +300,37 @@ impl Driver for NativeDriver {
         self.file.lock().unwrap().take();
     }
 }
-struct Pending {
+/// [local PoC patch — not upstream] 每个 IN 端点常驻多个 URB，完成即补交。
+///
+/// 上游每个端点只有一个 URB，而且只要 `ready` 里还有数据就直接返回、**不补交新 URB**：
+/// 端点于是处于“没有 IN 请求挂着”的状态，iPhone 侧 NCM 上行 FIFO 溢出后自己丢包，
+/// 宿主侧没有任何计数器能看见（视频走 TCP 会重传所以看不出来，音频走 UDP ⇒ 秒级缺口）。
+const IN_URBS: usize = 4;
+struct Slot {
     urb: Box<Urb>,
     buffer: Vec<u8>,
     queued: bool,
+}
+struct Pending {
+    slots: Vec<Slot>,
+    kind: u8,
     ready: VecDeque<Vec<u8>>,
     failure: Option<i32>,
+}
+impl Pending {
+    fn busy(&self) -> bool {
+        self.slots.iter().any(|s| s.queued)
+    }
+    /// 把空槽全部提交，保证端点任何时候都有 IN 请求挂着（消费者慢不等于端点空着）。
+    fn submit_idle(&mut self, driver: &dyn Driver) -> UsbResult<()> {
+        for slot in self.slots.iter_mut().filter(|s| !s.queued) {
+            slot.urb.status = 0;
+            slot.urb.actual_length = 0;
+            driver.submit(&mut slot.urb)?;
+            slot.queued = true;
+        }
+        Ok(())
+    }
 }
 struct InState {
     closed: bool,
@@ -337,19 +362,38 @@ impl LinuxUsbHostDevice {
         }
     }
     fn reap(&self, s: &mut InState) -> UsbResult<()> {
+        // 关闭中不再补交 URB，否则取消流程会永远“有请求挂着”而超时。
+        let closed = s.closed;
         while let Some(token) = self.driver.reap()? {
-            let p = s
-                .endpoints
-                .values_mut()
-                .find(|p| std::ptr::from_ref(p.urb.as_ref()) as usize == token)
-                .ok_or_else(|| UsbError::Protocol("usbfs reaped an unknown URB".into()))?;
-            p.queued = false;
-            let n = (p.urb.actual_length.max(0) as usize).min(p.buffer.len());
-            if n > 0 {
-                p.ready.push_back(p.buffer[..n].to_vec());
+            let mut completed: Option<(u8, Vec<u8>, i32)> = None;
+            for (endpoint, p) in s.endpoints.iter_mut() {
+                let index = p
+                    .slots
+                    .iter()
+                    .position(|slot| std::ptr::from_ref(slot.urb.as_ref()) as usize == token);
+                if let Some(index) = index {
+                    let slot = &mut p.slots[index];
+                    slot.queued = false;
+                    let n = (slot.urb.actual_length.max(0) as usize).min(slot.buffer.len());
+                    let bytes = if n > 0 { slot.buffer[..n].to_vec() } else { vec![] };
+                    completed = Some((*endpoint, bytes, slot.urb.status));
+                    break;
+                }
             }
-            if p.urb.status < 0 && ![libc::ENOENT, libc::ECONNRESET].contains(&-p.urb.status) {
-                p.failure = Some(-p.urb.status);
+            let (endpoint, bytes, status) =
+                completed.ok_or_else(|| UsbError::Protocol("usbfs reaped an unknown URB".into()))?;
+            let Some(p) = s.endpoints.get_mut(&endpoint) else {
+                return Err(UsbError::Protocol("usbfs reaped an unknown endpoint".into()));
+            };
+            if !bytes.is_empty() {
+                p.ready.push_back(bytes);
+            }
+            if status < 0 && ![libc::ENOENT, libc::ECONNRESET].contains(&-status) {
+                p.failure = Some(-status);
+            }
+            // 完成即补交：绝不让端点空着等消费端。
+            if !closed {
+                let _ = p.submit_idle(self.driver.as_ref());
             }
         }
         Ok(())
@@ -373,6 +417,13 @@ impl LinuxUsbHostDevice {
                 let reaped = if !s.closed { self.reap(&mut s) } else { Ok(()) };
                 let closed = s.closed;
                 if let Some(p) = s.endpoints.get_mut(&endpoint) {
+                    if p.kind != kind {
+                        return Err(UsbError::Protocol("USB IN endpoint type changed".into()));
+                    }
+                    // [local PoC patch] 交数据之前先把空槽补满：端点任何时候都要有 IN 请求挂着。
+                    if !closed {
+                        let _ = p.submit_idle(self.driver.as_ref());
+                    }
                     if let Some(mut b) = p.ready.pop_front() {
                         if b.len() > max_bytes {
                             p.ready.push_front(b.split_off(max_bytes));
@@ -388,37 +439,42 @@ impl LinuxUsbHostDevice {
                     return Ok(Receive::Eof);
                 }
                 let p = s.endpoints.entry(endpoint).or_insert_with(|| {
-                    let mut buffer = vec![0; max_bytes.min(65536)];
-                    let urb = Box::new(Urb {
-                        kind,
-                        endpoint,
-                        status: 0,
-                        flags: 0,
-                        buffer: buffer.as_mut_ptr().cast(),
-                        buffer_length: buffer.len() as i32,
-                        actual_length: 0,
-                        start_frame: 0,
-                        packets: 0,
-                        error_count: 0,
-                        signr: 0,
-                        usercontext: std::ptr::null_mut(),
-                    });
+                    let slots = (0..IN_URBS)
+                        .map(|_| {
+                            let mut buffer = vec![0; max_bytes.min(65536)];
+                            let urb = Box::new(Urb {
+                                kind,
+                                endpoint,
+                                status: 0,
+                                flags: 0,
+                                buffer: buffer.as_mut_ptr().cast(),
+                                buffer_length: buffer.len() as i32,
+                                actual_length: 0,
+                                start_frame: 0,
+                                packets: 0,
+                                error_count: 0,
+                                signr: 0,
+                                usercontext: std::ptr::null_mut(),
+                            });
+                            Slot {
+                                urb,
+                                buffer,
+                                queued: false,
+                            }
+                        })
+                        .collect();
                     Pending {
-                        urb,
-                        buffer,
-                        queued: false,
+                        slots,
+                        kind,
                         ready: VecDeque::new(),
                         failure: None,
                     }
                 });
-                if p.urb.kind != kind {
+                if p.kind != kind {
                     return Err(UsbError::Protocol("USB IN endpoint type changed".into()));
                 }
-                if !p.queued {
-                    p.urb.status = 0;
-                    p.urb.actual_length = 0;
-                    self.driver.submit(&mut p.urb)?;
-                    p.queued = true;
+                if !closed {
+                    p.submit_idle(self.driver.as_ref())?;
                 }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -558,20 +614,20 @@ impl UsbHostDevice for LinuxUsbHostDevice {
         }
         s.closed = true;
         for p in s.endpoints.values() {
-            if p.queued {
+            for slot in p.slots.iter().filter(|s| s.queued) {
                 let _ = self
                     .driver
-                    .discard(std::ptr::from_ref(p.urb.as_ref()) as usize);
+                    .discard(std::ptr::from_ref(slot.urb.as_ref()) as usize);
             }
         }
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut failure = None;
-        while s.endpoints.values().any(|p| p.queued) {
+        while s.endpoints.values().any(|p| p.busy()) {
             if let Err(error) = self.reap(&mut s) {
                 failure = Some(error);
                 break;
             }
-            if s.endpoints.values().any(|p| p.queued) {
+            if s.endpoints.values().any(|p| p.busy()) {
                 if Instant::now() >= deadline {
                     failure = Some(UsbError::Io(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -585,7 +641,9 @@ impl UsbHostDevice for LinuxUsbHostDevice {
         // Closing the fd is authoritative: the kernel can no longer write any pending buffers.
         self.driver.close();
         for p in s.endpoints.values_mut() {
-            p.queued = false;
+            for slot in p.slots.iter_mut() {
+                slot.queued = false;
+            }
         }
         failure.map_or(Ok(()), Err)
     }
@@ -699,7 +757,10 @@ mod tests {
         )
     }
     #[test]
-    fn timeout_keeps_one_urb_and_next_reap_keeps_every_byte() {
+    fn endpoint_keeps_in_urbs_posted_and_next_reap_keeps_every_byte() {
+        // [local PoC patch] 上游契约是“每个端点只挂一个 URB，交数据时不补交”，
+        // 那会让端点出现“没有 IN 请求挂着”的窗口，iPhone 侧 FIFO 溢出后自己丢包（音频秒级缺口）。
+        // 现在改成：常驻 IN_URBS 个 URB，完成即补交；字节切分行为不变。
         let (d, s) = device();
         assert_eq!(
             d.bulk_in(0x85, 20, Duration::ZERO).unwrap(),
@@ -711,7 +772,7 @@ mod tests {
         );
         let token = {
             let s = s.lock().unwrap();
-            assert_eq!(s.submitted.len(), 1);
+            assert_eq!(s.submitted.len(), super::IN_URBS);
             s.submitted[0]
         };
         s.lock()
@@ -726,12 +787,13 @@ mod tests {
             d.bulk_in(0x85, 2, Duration::ZERO).unwrap(),
             Receive::Data(vec![3, 4])
         );
-        assert_eq!(s.lock().unwrap().submitted.len(), 1);
+        // 完成的那一槽立刻补交，端点始终挂满 IN_URBS 个 URB。
+        assert!(s.lock().unwrap().submitted.len() >= super::IN_URBS);
         assert_eq!(
             d.bulk_in(0x85, 20, Duration::ZERO).unwrap(),
             Receive::Timeout
         );
-        assert_eq!(s.lock().unwrap().submitted.len(), 2);
+        assert!(s.lock().unwrap().submitted.len() >= super::IN_URBS);
     }
     #[test]
     fn close_discards_and_reaps_partial_or_racing_completion_bytes() {
@@ -744,13 +806,28 @@ mod tests {
                 s.discard_fails = !cancelled;
             }
             d.close().unwrap();
-            assert_eq!(
-                d.bulk_in(0x85, 20, Duration::ZERO).unwrap(),
-                Receive::Data(vec![0x40, 0x40, 0, 6])
-            );
+            // [local PoC patch] 每端点现在挂多个 URB：取消后残留字节可能出现多份，
+            // 先把剩下读完（内容必须一致），再要求 Eof。
+            match d.bulk_in(0x85, 20, Duration::ZERO).unwrap() {
+                Receive::Data(b) => assert_eq!(b, vec![0x40, 0x40, 0, 6]),
+                Receive::Eof => {}
+                other => panic!("unexpected {other:?}"),
+            }
+            for _ in 0..super::IN_URBS {
+                match d.bulk_in(0x85, 20, Duration::ZERO).unwrap() {
+                    Receive::Data(b) => assert_eq!(b, vec![0x40, 0x40, 0, 6]),
+                    Receive::Eof => break,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
             assert_eq!(d.bulk_in(0x85, 20, Duration::ZERO).unwrap(), Receive::Eof);
             let s = s.lock().unwrap();
-            assert_eq!(s.events, ["discard", "close"]);
+            // [local PoC patch] 现在每端点挂了多个 URB，逐个取消后才 close。
+            assert_eq!(
+                s.events.iter().filter(|e| **e == "discard").count(),
+                super::IN_URBS
+            );
+            assert_eq!(s.events.last().map(String::as_str), Some("close"));
         }
     }
     #[test]
@@ -788,10 +865,11 @@ mod tests {
         d.bulk_in(0x85, 20, Duration::ZERO).unwrap();
         d.interrupt_in(0x83, 64, Duration::ZERO).unwrap();
         let tokens = s.lock().unwrap().submitted.clone();
+        // [local PoC patch] 每个端点现在提交 IN_URBS 个槽，中断端点从第二个槽组开始。
         s.lock()
             .unwrap()
             .completions
-            .extend([(tokens[1], vec![9], 0), (tokens[0], vec![1, 2], 0)]);
+            .extend([(tokens[super::IN_URBS], vec![9], 0), (tokens[0], vec![1, 2], 0)]);
         assert_eq!(
             d.bulk_in(0x85, 20, Duration::ZERO).unwrap(),
             Receive::Data(vec![1, 2])
