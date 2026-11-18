@@ -70,10 +70,11 @@ fn receiver_stats_line(
     Some(json!({
         "event": "diagnostic",
         "message": format!(
-            "receiver stats decodedLatency={}ms renderLatency={}ms p95={}ms decodeQueue={} renderedFps={} dropped={} late={} superseded={} resets={} decodeMs={} relayKernelUnsent={}",
+            "receiver stats decodedLatency={}ms renderLatency={}ms p95={}ms decodeQueue={} renderedFps={} dropped={} late={} superseded={} resets={} decodeMs={} relayKernelUnsent={} audioBuf={}ms audioUnderruns={} trims={} trimFrames={} xfade={}",
             f("decodedLatencyMs"), f("renderedLatencyMs"), f("decodedLatencyP95Ms").as_f64().unwrap_or(-1.0),
             f("decodeQueue"), f("renderedFps"), f("dropped"), f("renderLateFrames"),
             f("renderSupersededFrames"), f("decoderResets"), f("decodeMs"), f("relayKernelUnsentBytes"),
+            f("audioBufferedMs"), f("audioUnderruns"), f("audioTrims"), f("audioTrimmedFrames"), f("audioCrossfades"),
         ),
         "time": crate::platform::wall_clock().as_millis() as u64,
         "type": "diagnostic",
