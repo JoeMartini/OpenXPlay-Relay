@@ -44,27 +44,40 @@ pub struct ReceiverDiagnostics {
 /// 这样"界面落后几秒"这类问题可以在服务端直接量出来，而不用猜。
 /// 只在 OXP_LOG_RECEIVER_STATS=1 时生效，默认不打扰上游行为。
 fn log_receiver_stats(sample: &Value, throttled: &mut Option<Instant>, now: Instant) {
-    if std::env::var("OXP_LOG_RECEIVER_STATS").ok().as_deref() != Some("1") {
-        return;
+    let enabled = std::env::var("OXP_LOG_RECEIVER_STATS").ok().as_deref() == Some("1");
+    if let Some(line) = receiver_stats_line(sample, throttled, now, enabled) {
+        eprintln!("{line}");
+    }
+}
+
+/// 纯函数版：`enabled=false` 时永远返回 None（上游行为）；否则按 5 秒节流返回一行。
+/// 拆出来是为了能在单测里直接验证"门控关掉时绝不输出"和"节流窗口"。
+fn receiver_stats_line(
+    sample: &Value,
+    throttled: &mut Option<Instant>,
+    now: Instant,
+    enabled: bool,
+) -> Option<Value> {
+    if !enabled {
+        return None;
     }
     let window = Duration::from_secs(5);
     if throttled.is_some_and(|at| now.saturating_duration_since(at) < window) {
-        return;
+        return None;
     }
     *throttled = Some(now);
     let f = |key: &str| sample.get(key).cloned().unwrap_or(Value::Null);
-    let line = json!({
+    Some(json!({
         "event": "diagnostic",
         "message": format!(
-            "receiver stats decodedLatency={}ms renderLatency={}ms p95={}ms decodeQueue={} renderedFps={} dropped={} late={} superseded={} resets={} decodeMs={}",
+            "receiver stats decodedLatency={}ms renderLatency={}ms p95={}ms decodeQueue={} renderedFps={} dropped={} late={} superseded={} resets={} decodeMs={} relayKernelUnsent={}",
             f("decodedLatencyMs"), f("renderedLatencyMs"), f("decodedLatencyP95Ms").as_f64().unwrap_or(-1.0),
             f("decodeQueue"), f("renderedFps"), f("dropped"), f("renderLateFrames"),
-            f("renderSupersededFrames"), f("decoderResets"), f("decodeMs"),
+            f("renderSupersededFrames"), f("decoderResets"), f("decodeMs"), f("relayKernelUnsentBytes"),
         ),
         "time": crate::platform::wall_clock().as_millis() as u64,
         "type": "diagnostic",
-    });
-    eprintln!("{line}");
+    }))
 }
 impl ReceiverDiagnostics {
     /// Takes oxp-relay's `receiver-info` and `stats` events and returns whether the event was
@@ -435,5 +448,30 @@ mod tests {
         d.observe(&stats("3", 60), t);
         assert!(!d.observe(&json!({"type":"receiver-stopped"}), t));
         assert!(d.snapshot(t).is_empty());
+    }
+
+    // [local PoC patch — not upstream] 门控与节流的行为必须可测：关掉时绝不出日志（上游行为），
+    // 打开时 5 秒一条，且一次输出就能看出"客户端停读/解码跟不上"的强度。
+    #[test]
+    fn receiver_stats_log_is_gated_off_by_default_and_throttled_to_five_seconds() {
+        let sample = json!({
+            "type":"stats","client":"browser-1","screen":0,
+            "renderedFps": 58, "decodeQueue": 2, "decodedLatencyMs": 41.5,
+            "renderedLatencyMs": 62.0, "decodedLatencyP95Ms": 88.0,
+            "dropped": 0, "renderLateFrames": 1, "renderSupersededFrames": 3,
+            "decoderResets": 0, "decodeMs": 12.5, "relayKernelUnsentBytes": 4096
+        });
+        let now = Instant::now();
+        let mut at = None;
+        assert!(receiver_stats_line(&sample, &mut at, now, false).is_none());
+        assert!(at.is_none(), "门控关掉时不得消耗节流窗口");
+        let line = receiver_stats_line(&sample, &mut at, now, true).expect("enabled ⇒ 必须输出一行");
+        assert_eq!(line["event"], "diagnostic");
+        let msg = line["message"].as_str().unwrap();
+        assert!(msg.contains("renderedFps=58"), "{msg}");
+        assert!(msg.contains("decodeQueue=2"), "{msg}");
+        assert!(msg.contains("relayKernelUnsent=4096"), "{msg}");
+        assert!(receiver_stats_line(&sample, &mut at, now + Duration::from_millis(4999), true).is_none());
+        assert!(receiver_stats_line(&sample, &mut at, now + Duration::from_secs(5), true).is_some());
     }
 }
